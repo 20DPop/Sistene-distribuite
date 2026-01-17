@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # --- SERVICII DE INFRASTRUCTURĂ ---
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - app-network
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - app-network
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+
+  # --- SERVICIILE APLICAȚIEI NOASTRE ---
+  api-server-1:
+    build: . # Spune Docker Compose să construiască imaginea folosind Dockerfile-ul din directorul curent.
+    container_name: api-server-1
+    ports:
+      - "3001:3001" # Mapează portul 3001 al gazdei la portul 3001 al containerului.
+    environment:
+      - PORT=3001
+      - MONGO_URI=mongodb://mongo:27017/distributed_games
+      - REDIS_URL=redis://redis:6379
+      - RABBIT_URI=amqp://guest:guest@rabbitmq:5672
+    depends_on: # Nu porni acest serviciu până când celelalte nu sunt gata.
+      - mongo
+      - redis
+      - rabbitmq
+    networks:
+      - app-network
+
+  api-server-2:
+    build: . # Refolosește aceeași imagine construită pentru api-server-1.
+    container_name: api-server-2
+    ports:
+      - "3002:3001" # Mapează portul 3002 al gazdei la portul 3001 al containerului.
+    environment:
+      - PORT=3001 # Portul intern rămâne același.
+      - MONGO_URI=mongodb://mongo:27017/distributed_games
+      - REDIS_URL=redis://redis:6379
+      - RABBIT_URI=amqp://guest:guest@rabbitmq:5672
+    depends_on:
+      - mongo
+      - redis
+      - rabbitmq
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  mongo-data:
+    driver: local
