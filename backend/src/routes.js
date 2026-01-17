@@ -5,50 +5,50 @@ const config = require("./config");
 const auth = require("./auth");
 
 // Modele
-const PokerGame = require("./models/pokerGame.model.js");
-const HangmanGame = require("./models/hangmanGame.model.js"); // Nou
+const User = require("./models/user.model");
+const PokerGame = require("./models/pokerGame.model");
+const HangmanGame = require("./models/hangmanGame.model");
 const ChatMessage = require('./models/chatMessage.model');
 
 // Servicii
-const PokerService = require("./services/poker.service.js");
-const HangmanService = require("./services/hangman.service.js"); // Nou
+const PokerService = require("./services/poker.service");
+const HangmanService = require("./services/hangman.service");
 
-// Module pentru comunicare
+// Module Comunicare
 const { publisher: redisPublisher } = require('./redisClient');
 const { getChannel: getRabbitChannel, GLOBAL_CHAT_EXCHANGE, ROOM_CHAT_EXCHANGE } = require('./rabbitClient');
 const sseManager = require('./sseManager');
 
-const routes = new Router({
-    prefix: '/api'
-});
+const routes = new Router({ prefix: '/api' });
 
-// --- Funcție Helper ---
+// --- Ajutor Sincronizare Redis ---
 async function publishGameState(gameId, gameState) {
     try {
         const channel = `game-updates:${gameId}`;
         await redisPublisher.publish(channel, JSON.stringify(gameState));
     } catch (error) {
-        console.error(`[Redis] Failed to publish game state for ${gameId}:`, error);
+        console.error(`[Redis Publish Error] ${gameId}:`, error);
     }
 }
 
-// --- Middleware de Autentificare ---
+// --- Middleware Autentificare ---
 routes.use(async (ctx, next) => {
-    if (ctx.path.startsWith('/api/auth') || ctx.path === '/api/events') {
-        await next();
-        return;
+    // Rute publice
+    if (ctx.path === '/api/auth/register' || ctx.path === '/api/auth/login' || ctx.path === '/api/events') {
+        return await next();
     }
+
     const token = ctx.cookies.get("token");
     if (!auth.isValidToken(token)) {
         ctx.status = 401;
-        ctx.body = { success: false, error: "Token invalid sau expirat." };
+        ctx.body = { success: false, error: "Sesiune expirată. Te rugăm să te autentifici." };
         return;
     }
     ctx.state.username = auth.getUsernameFromToken(token);
     await next();
 });
 
-// --- Rute de Autentificare ---
+// --- Rute Autentificare ---
 routes.post('/auth/register', async (ctx) => {
     const { username, password } = ctx.request.body;
     const { errors } = await auth.registerUser(username, password);
@@ -57,7 +57,7 @@ routes.post('/auth/register', async (ctx) => {
         return ctx.body = { success: false, errors };
     }
     ctx.status = 201;
-    ctx.body = { success: true, message: "Cont creat cu succes!" };
+    ctx.body = { success: true, message: "Cont creat!" };
 });
 
 routes.post('/auth/login', async (ctx) => {
@@ -69,240 +69,174 @@ routes.post('/auth/login', async (ctx) => {
     }
     const token = auth.createToken(username);
     ctx.cookies.set("token", token, config.cookieOptions);
-    ctx.status = 200;
-    ctx.body = { success: true, token };
+    ctx.body = { success: true, username };
 });
 
-// --- RUTA PENTRU SERVER-SENT EVENTS (SSE) ---
+routes.post('/auth/logout', async (ctx) => {
+    ctx.cookies.set("token", null);
+    ctx.body = { success: true };
+});
+
+// --- SSE (Server-Sent Events) ---
 routes.get('/events', async (ctx) => {
     const token = ctx.cookies.get("token");
     const username = auth.getUsernameFromToken(token);
+    
     if (!username) {
         ctx.status = 401;
-        return ctx.body = "Unauthorized";
+        return;
     }
+
     ctx.request.socket.setTimeout(0);
     ctx.req.socket.setNoDelay(true);
     ctx.req.socket.setKeepAlive(true);
-    ctx.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+
+    ctx.set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+    });
+
     const stream = new PassThrough();
     ctx.status = 200;
     ctx.body = stream;
-    ctx.res = stream;
-    sseManager.addClient(username, ctx);
-    sseManager.sendEventToUser(username, 'connected', { message: `Welcome, ${username}!` });
-    ctx.req.on('close', () => { sseManager.removeClient(username); });
+
+    // Înregistrăm clientul pe acest nod
+    await sseManager.addClient(username, ctx);
+
+    ctx.req.on('close', () => {
+        sseManager.removeClient(username);
+    });
 });
 
-// --- Rute pentru Poker ---
+// --- Utilitare Utilizatori ---
+routes.get('/users/online', async (ctx) => {
+    const users = await sseManager.getGlobalOnlineUsers();
+    ctx.body = { success: true, users };
+});
+
+// --- Rute POKER ---
 routes.get('/poker/games', async (ctx) => {
-    const games = await PokerGame.find({ inProgress: false }, 'gameId creatorUsername players options.maxPlayers');
-    const gamesList = games.map(game => ({ gameId: game.gameId, creatorUsername: game.creatorUsername, playerCount: game.players.length, maxPlayers: game.options.maxPlayers }));
-    ctx.body = { success: true, games: gamesList };
+    const games = await PokerGame.find({ inProgress: false });
+    ctx.body = { success: true, games };
 });
 
 routes.post('/poker/create', async (ctx) => {
     const username = ctx.state.username;
-    const { gameId, password, smallBlind, bigBlind, maxPlayers, stack } = ctx.request.body;
-    if (await PokerGame.findOne({ gameId })) {
-        ctx.status = 400;
-        return ctx.body = { success: false, error: "O masă cu acest nume există deja." };
-    }
+    const { gameId, options } = ctx.request.body;
+    
+    const existing = await PokerGame.findOne({ gameId });
+    if (existing) { ctx.status = 400; return ctx.body = { success: false, error: "Numele mesei există deja." }; }
+
     const newGame = new PokerGame({
-        gameId, creatorUsername: username, password: password || null,
-        options: { smallBlind: smallBlind || 10, bigBlind: bigBlind || 20, maxPlayers: maxPlayers || 9, minPlayers: 2 },
-        players: [{ username, stack: stack || 1000, status: 'waiting' }]
+        gameId,
+        creatorUsername: username,
+        options: options || { smallBlind: 10, bigBlind: 20, maxPlayers: 9, minPlayers: 2 },
+        players: [{ username, stack: 1000, status: 'waiting' }]
     });
+
     await newGame.save();
-    ctx.status = 201;
-    ctx.body = { success: true, gameState: newGame.toObject() };
+    ctx.body = { success: true, gameState: newGame };
 });
 
 routes.post('/poker/join', async (ctx) => {
     const username = ctx.state.username;
-    const { gameId, password, stack } = ctx.request.body;
-    const game = await PokerGame.findOne({ gameId }).select('+password');
-    if (!game) { ctx.status = 404; return ctx.body = { success: false, error: "Masa nu există." }; }
-    if (game.password && game.password !== password) { ctx.status = 403; return ctx.body = { success: false, error: "Parolă incorectă." }; }
-    if (game.players.length >= game.options.maxPlayers) { ctx.status = 400; return ctx.body = { success: false, error: "Masa este plină." }; }
-    if (game.players.some(p => p.username === username)) { ctx.status = 400; return ctx.body = { success: false, error: "Ești deja la această masă." }; }
-    game.players.push({ username, stack: stack || 1000, status: 'waiting' });
-    await game.save();
-    const gameState = game.toObject();
-    sseManager.joinRoom(username, gameId);
-    await publishGameState(gameId, gameState);
-    ctx.status = 200;
-    ctx.body = { success: true, gameState };
-});
-
-routes.post('/poker/start', async (ctx) => {
-    const username = ctx.state.username;
     const { gameId } = ctx.request.body;
-    let game = await PokerGame.findOne({ gameId });
-    if (!game) { ctx.status = 404; return; }
-    if (game.creatorUsername !== username) { ctx.status = 403; return ctx.body = { success: false, error: "Doar creatorul poate porni jocul." }; }
-    try {
-        game = PokerService.startNewHand(game);
-        await game.save();
-        const gameState = game.toObject();
-        await publishGameState(gameId, gameState);
-        ctx.status = 200;
-        ctx.body = { success: true, gameState };
-    } catch (error) {
-        ctx.status = 400;
-        ctx.body = { success: false, error: error.message };
+    const game = await PokerGame.findOne({ gameId });
+
+    if (!game || game.players.length >= game.options.maxPlayers) {
+        ctx.status = 400; return ctx.body = { success: false, error: "Nu te poți alătura." };
     }
+
+    game.players.push({ username, stack: 1000, status: 'waiting' });
+    await game.save();
+    
+    sseManager.joinRoom(username, gameId);
+    await publishGameState(gameId, game);
+    ctx.body = { success: true, gameState: game };
 });
 
 routes.post('/poker/action', async (ctx) => {
-    const username = ctx.state.username;
     const { gameId, action, amount } = ctx.request.body;
     const game = await PokerGame.findOne({ gameId });
-    if (!game) { ctx.status = 404; return ctx.body = { success: false, error: "Jocul nu a fost găsit." }; }
+    
     try {
-        const updatedGame = PokerService.handlePlayerAction(game, username, action, amount);
-        const result = await PokerGame.updateOne({ gameId, version: game.version }, updatedGame);
-        if (result.modifiedCount === 0) {
-            const freshGame = await PokerGame.findOne({ gameId });
-            if (freshGame && freshGame.version !== game.version) {
-                 throw new Error("Conflict de stare. Alt jucător a acționat. Starea a fost actualizată.");
-            }
-        }
-        const finalGameState = await PokerGame.findOne({ gameId });
-        await publishGameState(gameId, finalGameState.toObject());
-        ctx.status = 200;
-        ctx.body = { success: true, gameState: finalGameState.toObject() };
-    } catch (error) {
-        ctx.status = 400;
-        ctx.body = { success: false, error: error.message };
+        const updatedData = PokerService.handlePlayerAction(game, ctx.state.username, action, amount);
+        // Optimistic Locking Check
+        const result = await PokerGame.updateOne({ gameId, version: game.version }, updatedData);
+        
+        if (result.modifiedCount === 0) throw new Error("Conflict de versiune. Reîncearcă.");
+
+        const finalState = await PokerGame.findOne({ gameId });
+        await publishGameState(gameId, finalState);
+        ctx.body = { success: true };
+    } catch (e) {
+        ctx.status = 400; ctx.body = { success: false, error: e.message };
     }
 });
 
-routes.post('/poker/leave/:gameId', async (ctx) => {
-    const username = ctx.state.username;
-    const { gameId } = ctx.params;
-    const game = await PokerGame.findOne({ gameId });
-    if (!game) { ctx.status = 404; return; }
-    game.players = game.players.filter(p => p.username !== username);
-    await game.save();
-    sseManager.leaveRoom(username, gameId);
-    await publishGameState(gameId, game.toObject());
-    ctx.status = 200;
-    ctx.body = { success: true, message: `Ai părăsit jocul ${gameId}` };
-});
-
-// --- Rute pentru Hangman (DISTRIBUITE) ---
+// --- Rute HANGMAN ---
 routes.get('/hangman/games', async (ctx) => {
     const games = await HangmanGame.find({ status: 'waiting_for_guesser' });
     ctx.body = { success: true, games: games.map(g => HangmanService.getPublicState(g)) };
 });
 
 routes.post('/hangman/create', async (ctx) => {
-    const username = ctx.state.username;
     const { gameId } = ctx.request.body;
-
-    if (await HangmanGame.findOne({ gameId })) {
-        ctx.status = 400;
-        return ctx.body = { success: false, error: "Numele jocului este deja luat." };
-    }
-
-    const newGame = new HangmanGame({
-        gameId,
-        hostUsername: username,
-        players: [{ username }]
-    });
-
+    const newGame = new HangmanGame({ gameId, hostUsername: ctx.state.username, players: [{username: ctx.state.username}] });
     await newGame.save();
-    ctx.status = 201;
     ctx.body = { success: true, gameState: HangmanService.getPublicState(newGame) };
 });
 
 routes.post('/hangman/join', async (ctx) => {
-    const username = ctx.state.username;
     const { gameId } = ctx.request.body;
-
     const game = await HangmanGame.findOne({ gameId });
-    if (!game) { ctx.status = 404; return ctx.body = { success: false, error: "Jocul nu există." }; }
-    if (game.guesserUsername) { ctx.status = 400; return ctx.body = { success: false, error: "Jocul este plin." }; }
-
-    game.guesserUsername = username;
-    game.players.push({ username });
+    game.guesserUsername = ctx.state.username;
+    game.players.push({ username: ctx.state.username });
     game.status = 'waiting_for_word';
-
     await game.save();
-    sseManager.joinRoom(username, gameId);
-    await publishGameState(gameId, HangmanService.getPublicState(game));
     
-    ctx.body = { success: true, gameState: HangmanService.getPublicState(game) };
-});
-
-routes.post('/hangman/set-word', async (ctx) => {
-    const username = ctx.state.username;
-    const { gameId, word } = ctx.request.body;
-
-    const game = await HangmanGame.findOne({ gameId });
-    if (!game) { ctx.status = 404; return; }
-    if (game.hostUsername !== username) { ctx.status = 403; return ctx.body = { success: false, error: "Doar gazda poate pune cuvântul." }; }
-
-    if (!word || word.length < 3) {
-        ctx.status = 400;
-        return ctx.body = { success: false, error: "Cuvântul trebuie să aibă minim 3 litere." };
-    }
-
-    game.secretWord = word.toUpperCase();
-    game.status = 'in_progress';
-
-    await game.save();
+    sseManager.joinRoom(ctx.state.username, gameId);
     await publishGameState(gameId, HangmanService.getPublicState(game));
-    ctx.body = { success: true, gameState: HangmanService.getPublicState(game) };
+    ctx.body = { success: true };
 });
 
 routes.post('/hangman/action', async (ctx) => {
-    const username = ctx.state.username;
     const { gameId, letter } = ctx.request.body;
-
     const game = await HangmanGame.findOne({ gameId });
-    if (!game) { ctx.status = 404; return; }
-    if (game.guesserUsername !== username) { ctx.status = 403; return ctx.body = { success: false, error: "Doar cel care ghicește poate face această acțiune." }; }
-
-    try {
-        const updatedGame = HangmanService.handleGuess(game, letter);
-        await updatedGame.save();
-        await publishGameState(gameId, HangmanService.getPublicState(updatedGame));
-        ctx.body = { success: true, gameState: HangmanService.getPublicState(updatedGame) };
-    } catch (error) {
-        ctx.status = 400;
-        ctx.body = { success: false, error: error.message };
-    }
+    const updated = HangmanService.handleGuess(game, letter);
+    await updated.save();
+    await publishGameState(gameId, HangmanService.getPublicState(updated));
+    ctx.body = { success: true };
 });
 
-// --- Rute pentru Chat ---
+// --- Rute CHAT (DISTRIBUITE VIA RABBITMQ) ---
+
 routes.post('/chat/global', async (ctx) => {
-    const username = ctx.state.username;
     const { message } = ctx.request.body;
-    if (!message || !message.trim()) { ctx.status = 400; return; }
-    const newChatMessage = new ChatMessage({ sender: username, message, room: 'global' });
-    await newChatMessage.save();
-    getRabbitChannel().publish(GLOBAL_CHAT_EXCHANGE, '', Buffer.from(JSON.stringify(newChatMessage.toObject())));
-    ctx.status = 200;
+    const data = { sender: ctx.state.username, message, timestamp: new Date() };
+    getRabbitChannel().publish(GLOBAL_CHAT_EXCHANGE, '', Buffer.from(JSON.stringify(data)));
     ctx.body = { success: true };
 });
 
 routes.post('/chat/room/:roomId', async (ctx) => {
-    const username = ctx.state.username;
-    const { roomId } = ctx.params;
     const { message } = ctx.request.body;
-    if (!message || !message.trim()) { ctx.status = 400; return; }
-    const newChatMessage = new ChatMessage({ sender: username, message, room: roomId });
-    await newChatMessage.save();
-    getRabbitChannel().publish(ROOM_CHAT_EXCHANGE, `room.${roomId}`, Buffer.from(JSON.stringify(newChatMessage.toObject())));
-    ctx.status = 200;
+    const { roomId } = ctx.params;
+    const data = { room: roomId, sender: ctx.state.username, message, timestamp: new Date() };
+    getRabbitChannel().publish(ROOM_CHAT_EXCHANGE, `room.${roomId}`, Buffer.from(JSON.stringify(data)));
+    ctx.body = { success: true };
+});
+
+routes.post('/chat/private', async (ctx) => {
+    const { to, message } = ctx.request.body;
+    const data = { sender: ctx.state.username, to, message, timestamp: new Date() };
+    getRabbitChannel().publish(ROOM_CHAT_EXCHANGE, `private.${to}`, Buffer.from(JSON.stringify(data)));
     ctx.body = { success: true };
 });
 
 routes.get('/chat/history/:room', async (ctx) => {
-    const { room } = ctx.params;
-    const messages = await ChatMessage.find({ room }).sort({ createdAt: -1 }).limit(50);
+    const messages = await ChatMessage.find({ room: ctx.params.room }).sort({ createdAt: -1 }).limit(50);
     ctx.body = { success: true, messages: messages.reverse() };
 });
 
