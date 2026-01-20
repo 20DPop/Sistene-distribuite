@@ -175,6 +175,14 @@ router.get('/api/events', authMiddleware, async (ctx) => {
         clearInterval(keepAliveInterval);
         sseManager.removeClient(username);
     });
+
+    // ✅ FIX CRITICA: Previne închiderea automată a conexiunii SSE
+    // Promise care nu se rezolvă niciodată = conexiunea rămâne deschisă
+    await new Promise(() => {
+        // Această Promise nu se rezolvă niciodată
+        // Menține conexiunea SSE deschisă indefinit
+        // Cleanup se face automat prin event listeners ('close', 'error')
+    });
 });
 
 // ============================================================================

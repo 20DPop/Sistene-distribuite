@@ -1,4 +1,4 @@
-// src/sseManager.js
+// src/sseManager.js - FIXED VERSION
 const { publisher: redisPublisher } = require('./redisClient');
 
 const clients = new Map(); // { username: { stream, timestamp } }
@@ -85,9 +85,12 @@ function sendEventToUser(username, eventName, data) {
             const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
             client.stream.write(message);
         } catch (e) {
+            // ✅ FIX: NU apelăm removeClient() aici!
+            // Event listeners din routes.js ('close', 'error') se ocupă de cleanup
             console.error(`[SSE Manager] Error sending to ${username}:`, e.message);
-            // Dacă streaming eșuează, înlăturăm clientul
-            removeClient(username);
+            
+            // Doar marcăm clientul ca invalid
+            clients.delete(username);
         }
     }
 }
@@ -103,7 +106,10 @@ function broadcastEvent(eventName, data) {
             successCount++;
         } catch (e) {
             console.error(`[SSE Manager] Broadcast failed for ${username}:`, e.message);
-            removeClient(username);
+            
+            // ✅ FIX: NU apelăm removeClient() aici!
+            // Doar ștergem din map
+            clients.delete(username);
             failCount++;
         }
     });

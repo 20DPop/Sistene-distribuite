@@ -1,4 +1,4 @@
-// src/services/poker.service.js - FIXED VERSION
+// src/services/poker.service.js - FIXED VERSION WITH IMPROVED EVALUATION
 const Table = require('holdem-poker').Table;
 
 const SUITS = ['h', 'd', 'c', 's'];
@@ -19,41 +19,160 @@ function createShuffledDeck() {
 }
 
 /**
- * ✅ FIX: Evaluare simplificată de fallback pentru când biblioteca nu funcționează
- * Returnează un rank simplificat bazat pe numărul de cărți identice
+ * ✅ IMPROVED: Evaluare completă cu detectare straight, flush, și comparare kickers
+ * ACEASTĂ FUNCȚIE REZOLVĂ BUG-UL: "Câștigă ambii jucători"
+ * 
+ * Problema originală: simpleFallbackEvaluation() returnează același rank pentru:
+ *   - Player1: Pair of Aces → rank: 2
+ *   - Player2: Pair of Kings → rank: 2
+ *   Rezultat: AMBII sunt câștigători!
+ * 
+ * Soluția: Adaugă tiebreaker care compară:
+ *   - Valoarea pair-ului (Aces = 14 > Kings = 13)
+ *   - Kickers (cărțile rămase)
  */
-function simpleFallbackEvaluation(cards) {
+function improvedFallbackEvaluation(cards) {
     const ranks = cards.map(c => c.slice(0, -1));
     const suits = cards.map(c => c.slice(-1));
     
+    // Mapare rank values pentru comparare
+    const rankValues = {
+        '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+        'T': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14
+    };
+    
+    // Sortare cărți descrescător
+    const sortedCards = cards
+        .map(c => ({ rank: c.slice(0, -1), suit: c.slice(-1), value: rankValues[c.slice(0, -1)] }))
+        .sort((a, b) => b.value - a.value);
+    
     // Numără apariții pentru fiecare rank
     const rankCounts = {};
-    ranks.forEach(r => {
-        rankCounts[r] = (rankCounts[r] || 0) + 1;
+    sortedCards.forEach(c => {
+        rankCounts[c.rank] = (rankCounts[c.rank] || 0) + 1;
     });
     
-    const counts = Object.values(rankCounts).sort((a, b) => b - a);
-    const maxCount = counts[0];
+    const counts = Object.entries(rankCounts)
+        .map(([rank, count]) => ({ rank, count, value: rankValues[rank] }))
+        .sort((a, b) => {
+            if (b.count !== a.count) return b.count - a.count;
+            return b.value - a.value;
+        });
     
-    // Verifică flush (toate aceleași suit)
+    const maxCount = counts[0].count;
+    
+    // Verifică flush
     const isFlush = suits.every(s => s === suits[0]);
     
-    // Evaluare simplă
-    if (maxCount === 4) {
-        return { name: 'Four of a Kind', rank: 8 };
-    } else if (maxCount === 3 && counts[1] === 2) {
-        return { name: 'Full House', rank: 7 };
-    } else if (isFlush) {
-        return { name: 'Flush', rank: 6 };
-    } else if (maxCount === 3) {
-        return { name: 'Three of a Kind', rank: 4 };
-    } else if (maxCount === 2 && counts[1] === 2) {
-        return { name: 'Two Pair', rank: 3 };
-    } else if (maxCount === 2) {
-        return { name: 'Pair', rank: 2 };
+    // Verifică straight (inclusiv Ace low A-2-3-4-5)
+    let isStraight = false;
+    let straightHighCard = 0;
+    
+    if (new Set(ranks).size === 5) {
+        // Verifică straight normal
+        if (sortedCards[0].value - sortedCards[4].value === 4) {
+            isStraight = true;
+            straightHighCard = sortedCards[0].value;
+        }
+        // Verifică wheel (A-2-3-4-5)
+        else if (sortedCards[0].rank === 'A' && sortedCards[1].rank === '5' && 
+                 sortedCards[2].rank === '4' && sortedCards[3].rank === '3' && 
+                 sortedCards[4].rank === '2') {
+            isStraight = true;
+            straightHighCard = 5; // În wheel, 5 e high card
+        }
     }
     
-    return { name: 'High Card', rank: 1 };
+    // Straight Flush
+    if (isStraight && isFlush) {
+        return { 
+            name: 'Straight Flush', 
+            rank: 9,
+            tiebreaker: straightHighCard
+        };
+    }
+    
+    // Four of a Kind
+    if (maxCount === 4) {
+        return { 
+            name: 'Four of a Kind', 
+            rank: 8,
+            tiebreaker: counts[0].value * 1000 + counts[1].value
+        };
+    }
+    
+    // Full House
+    if (maxCount === 3 && counts.length >= 2 && counts[1].count === 2) {
+        return { 
+            name: 'Full House', 
+            rank: 7,
+            tiebreaker: counts[0].value * 100 + counts[1].value
+        };
+    }
+    
+    // Flush
+    if (isFlush) {
+        const tiebreaker = sortedCards.slice(0, 5).reduce((acc, c, i) => 
+            acc + c.value * Math.pow(100, 4 - i), 0
+        );
+        return { 
+            name: 'Flush', 
+            rank: 6,
+            tiebreaker
+        };
+    }
+    
+    // Straight
+    if (isStraight) {
+        return { 
+            name: 'Straight', 
+            rank: 5,
+            tiebreaker: straightHighCard
+        };
+    }
+    
+    // Three of a Kind
+    if (maxCount === 3) {
+        const kickers = counts.slice(1, 3).map(c => c.value);
+        return { 
+            name: 'Three of a Kind', 
+            rank: 4,
+            tiebreaker: counts[0].value * 10000 + (kickers[0] || 0) * 100 + (kickers[1] || 0)
+        };
+    }
+    
+    // Two Pair
+    if (maxCount === 2 && counts.length >= 2 && counts[1].count === 2) {
+        const kicker = counts.length >= 3 ? counts[2].value : 0;
+        return { 
+            name: 'Two Pair', 
+            rank: 3,
+            tiebreaker: counts[0].value * 10000 + counts[1].value * 100 + kicker
+        };
+    }
+    
+    // One Pair
+    if (maxCount === 2) {
+        const kickers = counts.slice(1, 4).map(c => c.value);
+        return { 
+            name: 'Pair', 
+            rank: 2,
+            tiebreaker: counts[0].value * 1000000 + 
+                       (kickers[0] || 0) * 10000 + 
+                       (kickers[1] || 0) * 100 + 
+                       (kickers[2] || 0)
+        };
+    }
+    
+    // High Card
+    const tiebreaker = sortedCards.slice(0, 5).reduce((acc, c, i) => 
+        acc + c.value * Math.pow(100, 4 - i), 0
+    );
+    return { 
+        name: 'High Card', 
+        rank: 1,
+        tiebreaker
+    };
 }
 
 /**
@@ -219,48 +338,35 @@ function handlePlayerAction(game, username, action, amount = 0) {
             
         case 'call': {
             const callAmount = highestBet - currentPlayer.currentBet;
-            if (callAmount <= 0) {
-                throw new Error("Nu poți da call, folosește Check.");
-            }
+            const actualCall = Math.min(callAmount, currentPlayer.stack);
             
-            const effectiveCall = Math.min(callAmount, currentPlayer.stack);
-            currentPlayer.stack -= effectiveCall;
-            currentPlayer.currentBet += effectiveCall;
+            currentPlayer.stack -= actualCall;
+            currentPlayer.currentBet += actualCall;
             
             if (currentPlayer.stack === 0) {
                 currentPlayer.status = 'all-in';
-                console.log(`[Poker] ${username} called ${effectiveCall} (ALL-IN)`);
-            } else {
-                console.log(`[Poker] ${username} called ${effectiveCall}`);
+                console.log(`[Poker] ${username} is all-in (call)`);
             }
+            
+            console.log(`[Poker] ${username} called ${actualCall} (total bet: ${currentPlayer.currentBet})`);
             break;
         }
             
         case 'raise': {
-            const raiseAmount = amount;
-            
-            if (raiseAmount <= highestBet) {
-                throw new Error("Raise-ul trebuie să fie mai mare decât highest bet.");
+            if (amount <= highestBet) {
+                throw new Error(`Raise trebuie să fie mai mare decât ${highestBet}`);
             }
             
-            const minRaise = highestBet + game.options.bigBlind;
-            if (raiseAmount < minRaise) {
-                throw new Error(`Raise-ul minim este ${minRaise}.`);
-            }
+            const totalRaiseAmount = amount - currentPlayer.currentBet;
+            const actualRaise = Math.min(totalRaiseAmount, currentPlayer.stack);
             
-            const totalNeeded = raiseAmount - currentPlayer.currentBet;
-            
-            if (totalNeeded > currentPlayer.stack) {
-                throw new Error("Nu ai suficiente fise pentru acest raise.");
-            }
-            
-            currentPlayer.stack -= totalNeeded;
-            currentPlayer.currentBet = raiseAmount;
+            currentPlayer.stack -= actualRaise;
+            currentPlayer.currentBet += actualRaise;
             
             game.lastRaiserUsername = username;
-            game.lastRaiseAmount = raiseAmount;
+            game.lastRaiseAmount = currentPlayer.currentBet;
             
-            // Resetăm hasActed pentru toți jucătorii activi
+            // Resetăm hasActed pentru toți jucătorii activi (trebuie să răspundă la raise)
             game.players.forEach(p => {
                 if (p.status === 'active' && p.username !== username) {
                     p.hasActed = false;
@@ -269,84 +375,86 @@ function handlePlayerAction(game, username, action, amount = 0) {
             
             if (currentPlayer.stack === 0) {
                 currentPlayer.status = 'all-in';
-                console.log(`[Poker] ${username} raised to ${raiseAmount} (ALL-IN)`);
-            } else {
-                console.log(`[Poker] ${username} raised to ${raiseAmount}`);
+                console.log(`[Poker] ${username} is all-in (raise to ${currentPlayer.currentBet})`);
             }
+            
+            console.log(`[Poker] ${username} raised to ${currentPlayer.currentBet}`);
             break;
         }
             
         default:
-            throw new Error(`Acțiune invalidă: ${action}`);
+            throw new Error(`Acțiune necunoscută: ${action}`);
     }
     
-    // 4. Marchează jucătorul ca având acționat
+    // 4. Marcăm că jucătorul a acționat
     currentPlayer.hasActed = true;
     
-    // 5. Adaugă bet-ul curent la pot
-    const totalBets = game.players.reduce((sum, p) => sum + p.currentBet, 0);
+    // 5. Verificăm dacă runda de pariuri s-a încheiat
+    if (isRoundComplete(game)) {
+        return advanceToNextRound(game);
+    }
     
-    // 6. Avansează la următorul jucător sau rundă
-    return advanceGame(game);
+    // 6. Trecem la următorul jucător
+    moveToNextPlayer(game);
+    
+    return game;
 }
 
 /**
- * Avansează jocul la următorul jucător sau rundă.
- * @param {object} game Starea jocului
- * @returns {object} Starea actualizată
+ * Verifică dacă runda de pariuri s-a încheiat.
  */
-function advanceGame(game) {
+function isRoundComplete(game) {
     const activePlayers = game.players.filter(p => p.status === 'active');
-    const allInPlayers = game.players.filter(p => p.status === 'all-in');
-    const foldedPlayers = game.players.filter(p => p.status === 'folded');
     
-    const playersInHand = activePlayers.length + allInPlayers.length;
-    
-    // Dacă doar un jucător a rămas (toți ceilalți au dat fold)
-    if (playersInHand === 1) {
-        return declareWinner(game);
+    // Dacă nu mai sunt jucători activi, trecem la următoarea rundă
+    if (activePlayers.length === 0) {
+        return true;
     }
     
     // Verificăm dacă toți jucătorii activi au acționat
     const allActed = activePlayers.every(p => p.hasActed);
+    if (!allActed) {
+        return false;
+    }
     
-    // Verificăm dacă toți au același bet (sau sunt all-in/folded)
+    // Verificăm dacă toți au același bet
     const highestBet = Math.max(...game.players.map(p => p.currentBet));
     const allBetsEqual = activePlayers.every(p => p.currentBet === highestBet);
     
-    if (allActed && allBetsEqual) {
-        // Toți au acționat și bet-urile sunt egale -> trecem la următoarea rundă
-        return advanceToNextRound(game);
-    }
-    
-    // Găsim următorul jucător activ
-    let nextIndex = (game.currentPlayerIndex + 1) % game.players.length;
-    let attempts = 0;
-    
-    while (attempts < game.players.length) {
-        const nextPlayer = game.players[nextIndex];
-        
-        if (nextPlayer.status === 'active') {
-            game.currentPlayerIndex = nextIndex;
-            console.log(`[Poker] Next player: ${nextPlayer.username}`);
-            return game;
-        }
-        
-        nextIndex = (nextIndex + 1) % game.players.length;
-        attempts++;
-    }
-    
-    // Dacă nu mai există jucători activi (toți all-in/folded)
-    return advanceToNextRound(game);
+    return allBetsEqual;
 }
 
 /**
- * Avansează la următoarea rundă (flop, turn, river, showdown).
- * @param {object} game Starea jocului
- * @returns {object} Starea actualizată
+ * Mută indexul la următorul jucător activ.
+ */
+function moveToNextPlayer(game) {
+    const numPlayers = game.players.length;
+    let attempts = 0;
+    
+    do {
+        game.currentPlayerIndex = (game.currentPlayerIndex + 1) % numPlayers;
+        attempts++;
+        
+        if (attempts > numPlayers) {
+            console.error('[Poker] Could not find next active player');
+            return;
+        }
+    } while (game.players[game.currentPlayerIndex].status !== 'active');
+    
+    console.log(`[Poker] Next player: ${game.players[game.currentPlayerIndex].username}`);
+}
+
+/**
+ * Avansează jocul la următoarea rundă (flop → turn → river → showdown).
  */
 function advanceToNextRound(game) {
-    // Colectăm bet-urile în pot
+    // Verificăm dacă toți jucătorii în afară de unul au dat fold
+    const contenders = game.players.filter(p => p.status !== 'folded');
+    if (contenders.length === 1) {
+        return declareWinner(game);
+    }
+    
+    // Colectăm pariurile în pot
     const totalBets = game.players.reduce((sum, p) => sum + p.currentBet, 0);
     game.pot += totalBets;
     
@@ -431,7 +539,7 @@ function declareWinner(game) {
 }
 
 /**
- * ✅ FIXED: Evaluează mâinile la showdown cu logging îmbunătățit și fallback
+ * ✅ FIXED: Evaluează mâinile la showdown cu logging îmbunătățit și comparare tiebreaker
  * @param {object} game Starea jocului
  * @returns {object} Starea actualizată
  */
@@ -471,7 +579,8 @@ function evaluateShowdown(game) {
                     player,
                     handRank: 0,
                     handName: 'Invalid Hand',
-                    cards: []
+                    cards: [],
+                    tiebreaker: 0
                 };
             }
 
@@ -479,7 +588,7 @@ function evaluateShowdown(game) {
             console.log(`[Poker] ${player.username} cards: ${player.hand.join(' ')}`);
             
             try {
-                // ✅ FIX: Încercăm evaluarea cu biblioteca
+                // ✅ Încercăm evaluarea cu biblioteca
                 const result = Table.evaluateHand(allCards);
                 
                 console.log(`[Poker] ${player.username}: ${result.name} (rank: ${result.rank})`);
@@ -488,21 +597,23 @@ function evaluateShowdown(game) {
                     player,
                     handRank: result.rank,
                     handName: result.name,
-                    cards: result.cards || allCards
+                    cards: result.cards || allCards,
+                    tiebreaker: result.rank * 1000000 // Placeholder - biblioteca ar trebui să gestioneze
                 };
             } catch (err) {
                 console.error(`[Poker] Table.evaluateHand failed for ${player.username}:`, err.message);
                 evaluationFailed = true;
                 
-                // ✅ FIX: Folosim fallback simplu
-                const fallbackResult = simpleFallbackEvaluation(allCards);
-                console.log(`[Poker] ${player.username} (FALLBACK): ${fallbackResult.name} (rank: ${fallbackResult.rank})`);
+                // ✅ FIX: Folosim fallback îmbunătățit
+                const fallbackResult = improvedFallbackEvaluation(allCards);
+                console.log(`[Poker] ${player.username} (FALLBACK): ${fallbackResult.name} (rank: ${fallbackResult.rank}, tiebreaker: ${fallbackResult.tiebreaker})`);
                 
                 return {
                     player,
                     handRank: fallbackResult.rank,
                     handName: fallbackResult.name + ' (fallback)',
-                    cards: allCards
+                    cards: allCards,
+                    tiebreaker: fallbackResult.tiebreaker
                 };
             }
         });
@@ -511,13 +622,37 @@ function evaluateShowdown(game) {
             console.warn('[Poker] ⚠️ Using fallback evaluation - results may not be 100% accurate');
         }
 
+        // ✅ DEBUGGING DETALIAT
+        console.log('[Poker] 🔍 DETAILED EVALUATIONS:');
+        evaluations.forEach(e => {
+            console.log(`  - ${e.player.username}: ${e.handName} (rank: ${e.handRank}, tiebreaker: ${e.tiebreaker})`);
+        });
+
         // Găsim cel mai mare rank
         const bestRank = Math.max(...evaluations.map(e => e.handRank));
-        console.log(`[Poker] Best rank: ${bestRank}`);
+        console.log(`[Poker] Best rank found: ${bestRank}`);
         
-        // Găsim toți câștigătorii
-        const winners = evaluations.filter(e => e.handRank === bestRank);
-        console.log(`[Poker] Winners: ${winners.map(w => `${w.player.username} (${w.handName})`).join(', ')}`);
+        // ✅ VERIFICARE DE SIGURANȚĂ
+        if (bestRank === 0) {
+            console.error('[Poker] ⚠️ CRITICAL: All players evaluated with rank 0!');
+            console.error('[Poker] This indicates a complete evaluation failure.');
+        }
+        
+        // Găsim toți jucătorii cu best rank
+        let candidates = evaluations.filter(e => e.handRank === bestRank);
+        console.log(`[Poker] Candidates with rank ${bestRank}: ${candidates.map(c => c.player.username).join(', ')}`);
+        
+        // ✅ COMPARARE TIEBREAKER dacă sunt mai mulți candidați
+        if (candidates.length > 1 && candidates[0].tiebreaker !== undefined) {
+            const bestTiebreaker = Math.max(...candidates.map(c => c.tiebreaker || 0));
+            console.log(`[Poker] Multiple candidates - applying tiebreaker: ${bestTiebreaker}`);
+            
+            candidates = candidates.filter(c => (c.tiebreaker || 0) === bestTiebreaker);
+            console.log(`[Poker] Winners after tiebreaker: ${candidates.map(c => c.player.username).join(', ')}`);
+        }
+        
+        const winners = candidates;
+        console.log(`[Poker] ✅ Final Winners: ${winners.map(w => `${w.player.username} (${w.handName})`).join(', ')}`);
 
         // Salvăm evaluările în obiectele jucătorilor
         evaluations.forEach(e => {
