@@ -25,7 +25,7 @@ async function addClient(username, ctx, stream) {
             timestamp: Date.now()
         }));
 
-        console.log(`[SSE Manager] ✅ User connected: ${username} (Total: ${clients.size})`);
+        console.log(`[SSE Manager]  User connected: ${username} (Total: ${clients.size})`);
         
         // Trimitem un semnal "keep-alive" imediat ca browserul să confirme conexiunea
         stream.write(': connected\n\n');
@@ -85,8 +85,7 @@ function sendEventToUser(username, eventName, data) {
             const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
             client.stream.write(message);
         } catch (e) {
-            // ✅ FIX: NU apelăm removeClient() aici!
-            // Event listeners din routes.js ('close', 'error') se ocupă de cleanup
+            
             console.error(`[SSE Manager] Error sending to ${username}:`, e.message);
             
             // Doar marcăm clientul ca invalid
@@ -107,8 +106,7 @@ function broadcastEvent(eventName, data) {
         } catch (e) {
             console.error(`[SSE Manager] Broadcast failed for ${username}:`, e.message);
             
-            // ✅ FIX: NU apelăm removeClient() aici!
-            // Doar ștergem din map
+            
             clients.delete(username);
             failCount++;
         }

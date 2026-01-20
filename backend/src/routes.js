@@ -176,7 +176,7 @@ router.get('/api/events', authMiddleware, async (ctx) => {
         sseManager.removeClient(username);
     });
 
-    // ✅ FIX CRITICA: Previne închiderea automată a conexiunii SSE
+    //  FIX CRITICA: Previne închiderea automată a conexiunii SSE
     // Promise care nu se rezolvă niciodată = conexiunea rămâne deschisă
     await new Promise(() => {
         // Această Promise nu se rezolvă niciodată
@@ -282,7 +282,7 @@ router.post('/api/chat/rooms/create', authMiddleware, async (ctx) => {
         // Join SSE room pentru mesaje real-time
         sseManager.joinRoom(username, trimmedRoomName);
 
-        // ✅ BROADCAST LA TOȚI UTILIZATORII
+        //  BROADCAST LA TOȚI UTILIZATORII
         const allRooms = await redisPublisher.sMembers('available_rooms');
         sseManager.broadcastEvent('roomsUpdate', { 
             availableRooms: Array.from(allRooms)
@@ -558,7 +558,7 @@ router.post('/api/poker/create', authMiddleware, async (ctx) => {
             return;
         }
 
-        // ✅ Asigură că options conține minPlayers
+        //  Asigură că options conține minPlayers
         const gameOptions = {
             smallBlind: options?.smallBlind || 10,
             bigBlind: options?.bigBlind || 20,
