@@ -1,152 +1,184 @@
 // src/sseManager.js
 const { publisher: redisPublisher } = require('./redisClient');
 
+const clients = new Map(); // { username: { stream, timestamp } }
+const rooms = new Map();   // { roomId: Set<username> }
 
-const clients = new Map();
-
-const rooms = new Map();
-
-async function addClient(username, ctx) {
-    clients.set(username, ctx);
+async function addClient(username, ctx, stream) {
+    // Dacă utilizatorul are deja o conexiune, o închidem
+    if (clients.has(username)) {
+        console.log(`[SSE Manager] User ${username} reconnecting, closing old connection`);
+        await removeClient(username);
+    }
+    
+    // Salvăm stream-ul prin care trimitem datele + timestamp
+    clients.set(username, { 
+        stream,
+        timestamp: Date.now()
+    });
     
     try {
-        // Adăugăm utilizatorul în Set-ul global din Redis
         await redisPublisher.sAdd('online_users', username);
-        
-        // Notificăm restul sistemului (opțional, prin Redis Pub/Sub) că un user s-a conectat
         await redisPublisher.publish('user-presence-updates', JSON.stringify({
             type: 'USER_CONNECTED',
-            username: username
+            username: username,
+            timestamp: Date.now()
         }));
 
-        console.log(`[SSE Manager] User connected: ${username} (Local node). Total global: (see Redis)`);
+        console.log(`[SSE Manager] ✅ User connected: ${username} (Total: ${clients.size})`);
+        
+        // Trimitem un semnal "keep-alive" imediat ca browserul să confirme conexiunea
+        stream.write(': connected\n\n');
+        
+        // Trimitem lista de utilizatori online imediat după conectare
+        const onlineUsers = await getGlobalOnlineUsers();
+        sendEventToUser(username, 'usersOnlineUpdate', onlineUsers);
+        
     } catch (err) {
-        console.error(`[SSE Manager] Redis error on addClient for ${username}:`, err);
+        console.error(`[SSE Manager] Redis error for ${username}:`, err);
+        // Continuăm oricum - conexiunea SSE funcționează local
     }
 }
 
-/**
- * Elimină un client și îl șterge din prezența globală Redis.
- */
 async function removeClient(username) {
-    if (clients.has(username)) {
+    const client = clients.get(username);
+    
+    if (client) {
+        // Închidem stream-ul
+        if (client.stream) {
+            try {
+                client.stream.end();
+            } catch (e) {
+                // Stream deja închis
+            }
+        }
+        
         clients.delete(username);
         
-        // Curățăm prezența utilizatorului în camerele locale ale acestui server
+        // Curățăm din toate rooms
         rooms.forEach((users, roomId) => {
-            if (users.has(username)) {
-                users.delete(username);
+            users.delete(username);
+            // Ștergem room-urile goale
+            if (users.size === 0) {
+                rooms.delete(roomId);
             }
         });
 
         try {
-            // Îl ștergem din Set-ul global din Redis
             await redisPublisher.sRem('online_users', username);
-            
-            // Notificăm restul sistemului
             await redisPublisher.publish('user-presence-updates', JSON.stringify({
                 type: 'USER_DISCONNECTED',
-                username: username
+                username: username,
+                timestamp: Date.now()
             }));
-
-            console.log(`[SSE Manager] User disconnected: ${username} (Local node).`);
+            console.log(`[SSE Manager] ❌ User disconnected: ${username} (Total: ${clients.size})`);
         } catch (err) {
-            console.error(`[SSE Manager] Redis error on removeClient for ${username}:`, err);
+            console.error(`[SSE Manager] Redis error removing ${username}:`, err);
         }
     }
 }
 
-/**
- * Trimite un eveniment către un utilizator specific, dacă este conectat la acest server.
- */
 function sendEventToUser(username, eventName, data) {
-    const clientCtx = clients.get(username);
-    
-    if (clientCtx && !clientCtx.res.writableEnded) {
+    const client = clients.get(username);
+    if (client && client.stream) {
         try {
-            // Formatul standard SSE: event: numele_evenimentului \n data: JSON_string \n\n
-            clientCtx.res.write(`event: ${eventName}\n`);
-            clientCtx.res.write(`data: ${JSON.stringify(data)}\n\n`);
+            const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+            client.stream.write(message);
         } catch (e) {
-            console.error(`[SSE Manager] Write error for ${username}:`, e.message);
+            console.error(`[SSE Manager] Error sending to ${username}:`, e.message);
+            // Dacă streaming eșuează, înlăturăm clientul
             removeClient(username);
         }
     }
 }
 
-/**
- * Trimite un eveniment către TOȚI utilizatorii conectați la ACEST server.
- * (Folosit pentru broadcast local după ce s-a primit un mesaj global din RabbitMQ)
- */
 function broadcastEvent(eventName, data) {
-    const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+    let successCount = 0;
+    let failCount = 0;
     
-    clients.forEach((clientCtx, username) => {
-        if (!clientCtx.res.writableEnded) {
-            try {
-                clientCtx.res.write(message);
-            } catch (e) {
-                console.error(`[SSE Manager] Broadcast error for ${username}:`, e.message);
-                removeClient(username);
-            }
+    clients.forEach((client, username) => {
+        try {
+            const message = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+            client.stream.write(message);
+            successCount++;
+        } catch (e) {
+            console.error(`[SSE Manager] Broadcast failed for ${username}:`, e.message);
+            removeClient(username);
+            failCount++;
         }
     });
+    
+    if (failCount > 0) {
+        console.log(`[SSE Manager] Broadcast: ${successCount} sent, ${failCount} failed`);
+    }
 }
 
-/**
- * Înregistrează local un utilizator într-o cameră de joc/chat.
- */
 function joinRoom(username, roomId) {
     if (!rooms.has(roomId)) {
         rooms.set(roomId, new Set());
     }
     rooms.get(roomId).add(username);
-    console.log(`[SSE Manager] ${username} joined room ${roomId} (on this node).`);
+    console.log(`[SSE Manager] ${username} joined room: ${roomId} (Room size: ${rooms.get(roomId).size})`);
 }
 
-/**
- * Elimină local un utilizator dintr-o cameră.
- */
 function leaveRoom(username, roomId) {
     const room = rooms.get(roomId);
     if (room) {
         room.delete(username);
-        if (room.size === 0) rooms.delete(roomId);
-        console.log(`[SSE Manager] ${username} left room ${roomId} (on this node).`);
+        console.log(`[SSE Manager] ${username} left room: ${roomId} (Room size: ${room.size})`);
+        
+        // Curățăm room-ul dacă e gol
+        if (room.size === 0) {
+            rooms.delete(roomId);
+            console.log(`[SSE Manager] Room ${roomId} deleted (empty)`);
+        }
     }
 }
 
-/**
- * Trimite un eveniment către utilizatorii dintr-o cameră conectați la acest server.
- */
 function sendEventToRoom(roomId, eventName, data) {
     const usersInRoom = rooms.get(roomId);
     if (usersInRoom) {
+        let count = 0;
         usersInRoom.forEach(username => {
             sendEventToUser(username, eventName, data);
+            count++;
         });
+        console.log(`[SSE Manager] Room ${roomId} broadcast: ${count} users`);
     }
 }
 
-/**
- * Returnează lista tuturor utilizatorilor online de pe TOATE serverele.
- */
 async function getGlobalOnlineUsers() {
     try {
-        return await redisPublisher.sMembers('online_users');
+        const redisUsers = await redisPublisher.sMembers('online_users');
+        return redisUsers;
     } catch (err) {
-        console.error("[SSE Manager] Error fetching global users:", err);
-        return Array.from(clients.keys()); // Fallback la lista locală
+        console.error('[SSE Manager] Redis error getting online users:', err);
+        // Fallback la lista locală
+        return Array.from(clients.keys());
     }
+}
+
+// Funcție pentru debug - verifică starea conexiunilor
+function getStatus() {
+    return {
+        connectedClients: clients.size,
+        users: Array.from(clients.keys()),
+        rooms: Array.from(rooms.entries()).map(([roomId, users]) => ({
+            roomId,
+            userCount: users.size,
+            users: Array.from(users)
+        }))
+    };
 }
 
 module.exports = {
-    addClient,
-    removeClient,
-    sendEventToUser,
+    addClient, 
+    removeClient, 
+    sendEventToUser, 
     broadcastEvent,
-    joinRoom,
-    leaveRoom,
-    sendEventToRoom,
-    getGlobalOnlineUsers
+    joinRoom, 
+    leaveRoom, 
+    sendEventToRoom, 
+    getGlobalOnlineUsers,
+    getStatus // Pentru debugging
 };

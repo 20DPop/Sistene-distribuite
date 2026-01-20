@@ -1,5 +1,5 @@
 import "./App.css";
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Routes, Route, Navigate, useNavigate, useParams } from "react-router-dom";
 import WelcomePage from "./components/WelcomePage";
 import Login from "./components/Login";
@@ -13,8 +13,7 @@ import PokerTable from "./components/poker/PokerTable";
 import HangmanLobby from "./components/hangman/HangmanLobby";
 import HangmanGame from "./components/hangman/HangmanGame";
 
-
-
+// --- Wrappere ---
 const PrivateChatWrapper = ({ messages, users, username, sendMessage, connectionStatus, onChatPartnerChange }) => {
   const { chatPartner } = useParams();
   
@@ -83,9 +82,12 @@ const RoomChatWrapper = ({
   );
 };
 
+// --- Utilitare ---
 const getTokenFromCookie = () => {
   const match = document.cookie.match(/token=([^;]+)/);
-  return match ? match[1] : null;
+  const token = match ? match[1] : null;
+  console.log('[Cookie] Token check:', token ? 'Present ✅' : 'Missing ❌');
+  return token;
 };
 
 const getUsernameFromToken = (token) => {
@@ -94,20 +96,22 @@ const getUsernameFromToken = (token) => {
         const payload = JSON.parse(atob(token.split('.')[1]));
         return payload.username;
     } catch (e) {
-        console.error("Failed to decode token:", e);
+        console.error('[Token] Failed to decode:', e);
         return null;
     }
 }
 
+// --- App Component ---
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(!!getTokenFromCookie());
   const [username, setUsername] = useState(() => getUsernameFromToken(getTokenFromCookie()));
   const [users, setUsers] = useState([]);
   const [messages, setMessages] = useState([]);
   const [connectionStatus, setConnectionStatus] = useState("disconnected");
-  const [availableRooms, setAvailableRooms] = useState([]);
+  
+  const [availableRooms, setAvailableRooms] = useState([]); 
   const [joinedRooms, setJoinedRooms] = useState([]);
-  const [usersInRooms, setUsersInRooms] = useState(new Map());
+  const [usersInRooms, setUsersInRooms] = useState(new Map()); 
   
   const [pokerGames, setPokerGames] = useState([]);
   const [currentPokerGame, setCurrentPokerGame] = useState(null);
@@ -123,162 +127,296 @@ function App() {
     localStorage.getItem('lastRoomChat')
   );
 
-  const websocketRef = useRef(null);
+  const eventSourceRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
   const navigate = useNavigate();
 
+  // --- API Communication ---
+  const sendActionViaAPI = useCallback(async (url, body, method = 'POST') => {
+      try {
+          const response = await fetch(url, {
+              method: method,
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'include',
+              body: JSON.stringify(body),
+          });
+          const data = await response.json();
+          if (!response.ok || !data.success) {
+              const errorMsg = data.error || data.errors?.[0] || 'Eroare necunoscută la server.';
+              console.error(`Eroare la apelul ${url}:`, errorMsg);
+              throw new Error(errorMsg);
+          }
+          return data;
+      } catch (error) {
+          console.error(`Eroare de comunicare la ${url}:`, error);
+          alert(`Eroare: ${error.message}`);
+          return { success: false, error: error.message };
+      }
+  }, []);
+
+  // --- SSE CONNECTION (FIXED WITH TOKEN POLLING) ---
+  const connectSSE = useCallback(() => {
+    console.log('[SSE] Attempting to connect...');
+    
+    // Cleanup old connection
+    if (eventSourceRef.current) {
+      console.log('[SSE] Closing existing connection');
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    
+    // Clear any pending reconnect
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
+    // Poll pentru token cu retry logic
+    const attemptConnection = (retries = 5) => {
+      const token = getTokenFromCookie();
+      
+      if (!token) {
+        if (retries > 0) {
+          console.log(`[SSE] No token found, retrying... (${retries} attempts left)`);
+          setTimeout(() => attemptConnection(retries - 1), 200);
+          return;
+        } else {
+          console.log('[SSE] No token found after all retries, skipping connection');
+          setConnectionStatus("disconnected");
+          return;
+        }
+      }
+
+      // Token găsit, conectează SSE
+      console.log('[SSE] Token found, establishing connection');
+      setConnectionStatus("connecting");
+
+      const sseUrl = `/api/events`;
+      console.log('[SSE] Creating EventSource:', sseUrl);
+      
+      try {
+        const es = new EventSource(sseUrl, { withCredentials: true });
+        eventSourceRef.current = es;
+
+        // Connection established
+        es.onopen = () => {
+          console.log('[SSE] ✅ Connection opened');
+          setConnectionStatus("connected");
+          
+          if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+          }
+        };
+
+        // Error handling
+        es.onerror = (error) => {
+          console.error('[SSE] ❌ Connection error:', error);
+          setConnectionStatus("disconnected");
+          
+          if (es.readyState === EventSource.CLOSED) {
+            console.log('[SSE] Connection closed by server');
+          }
+          
+          es.close();
+          eventSourceRef.current = null;
+          
+          // Retry după 3 secunde dacă avem token
+          if (getTokenFromCookie()) {
+            console.log('[SSE] Scheduling reconnect in 3s...');
+            reconnectTimeoutRef.current = setTimeout(() => {
+              console.log('[SSE] Retrying connection...');
+              connectSSE();
+            }, 3000);
+          }
+        };
+
+        // --- Event Listeners ---
+        
+        // Global Chat
+        es.addEventListener('globalChatMessage', (event) => {
+          console.log('[SSE] Global chat message received');
+          const data = JSON.parse(event.data);
+          setMessages(prev => [...prev, {
+            type: 'broadcast', 
+            content: data.message, 
+            username: data.sender, 
+            timestamp: data.timestamp
+          }]);
+        });
+        
+        // Room Chat
+        es.addEventListener('roomChatMessage', (event) => {
+          console.log('[SSE] Room chat message received');
+          const data = JSON.parse(event.data);
+          setMessages(prev => [...prev, {
+            type: 'room_message', 
+            room: data.room, 
+            sender: data.sender, 
+            text: data.message, 
+            timestamp: data.timestamp
+          }]);
+        });
+
+        // Private Chat
+        es.addEventListener('privateChatMessage', (event) => {
+          console.log('[SSE] Private chat message received');
+          const data = JSON.parse(event.data);
+          setMessages(prev => [...prev, {
+            type: 'private_message', 
+            sender: data.sender, 
+            to: data.to, 
+            text: data.message, 
+            timestamp: data.timestamp
+          }]);
+        });
+        
+        // Users Online Update
+        es.addEventListener('usersOnlineUpdate', (event) => {
+          console.log('[SSE] Users online update received');
+          const usersList = JSON.parse(event.data);
+          setUsers(usersList);
+        });
+
+        // ✅ FIX PROBLEMA 1 - Ascultăm actualizări pentru camere
+        es.addEventListener('roomsUpdate', (event) => {
+          console.log('[SSE] Rooms update received');
+          const data = JSON.parse(event.data);
+          if (data.availableRooms) {
+            setAvailableRooms(data.availableRooms);
+            console.log('[SSE] Available rooms updated:', data.availableRooms);
+          }
+        });
+
+        // Room Member Update
+        es.addEventListener('roomMemberUpdate', (event) => {
+          console.log('[SSE] Room member update received');
+          const data = JSON.parse(event.data);
+          if (data.roomName && data.memberCount !== undefined) {
+            setUsersInRooms(prev => {
+              const newMap = new Map(prev);
+              newMap.set(data.roomName, data.memberCount);
+              return newMap;
+            });
+          }
+        });
+
+        // Game State Update
+        es.addEventListener('gameStateUpdate', (event) => {
+          console.log('[SSE] Game state update received');
+          const gameState = JSON.parse(event.data);
+          
+          // Poker update
+          if (gameState.pot !== undefined && Array.isArray(gameState.players)) {
+            setCurrentPokerGame(gameState);
+            const myPlayer = gameState.players.find(p => p.username === username);
+            if (myPlayer) setMyPokerHand(myPlayer.hand || []);
+
+            if (gameState.round === 'finished' && !gameState.inProgress) {
+              setCurrentPokerGame(null);
+              setMyPokerHand([]);
+              navigate('/home/poker');
+            }
+          } 
+          // Hangman update
+          else if (gameState.status && gameState.maskedWord !== undefined) {
+            setCurrentHangmanGame(gameState);
+          }
+        });
+
+      } catch (err) {
+        console.error('[SSE] Failed to create EventSource:', err);
+        setConnectionStatus("disconnected");
+      }
+    };
+    
+    // Start connection attempt
+    attemptConnection();
+  }, [username, navigate]);
+
+  const disconnectSSE = useCallback(() => {
+    console.log('[SSE] Disconnecting...');
+    
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    
+    setConnectionStatus("disconnected");
+  }, []);
+
+  // --- Effects ---
+  
   useEffect(() => {
-    if (isLoggedIn) {
-      connectWebSocket();
+    if (isLoggedIn && username) {
+      console.log('[App] User logged in, connecting SSE');
+      connectSSE();
       fetchPokerGames();
-      checkCurrentPokerGame();
+      fetchHangmanGames();
+      fetchRooms(); // ✅ IMPORTANT: Încarcă camerele la login
     } else {
-      disconnectWebSocket();
+      console.log('[App] User not logged in, disconnecting SSE');
+      disconnectSSE();
       localStorage.removeItem('lastPrivateChatPartner');
       localStorage.removeItem('lastRoomChat');
       setLastPrivateChatPartner(null);
       setLastRoomChat(null);
     }
+    
     return () => {
-      disconnectWebSocket();
+      disconnectSSE();
     };
-  }, [isLoggedIn]);
+  }, [isLoggedIn, username, connectSSE, disconnectSSE]);
 
-  const checkCurrentPokerGame = async () => {
-    try {
-      const response = await fetch('/api/auth/poker/current-game', { credentials: 'include' });
-      const data = await response.json();
-      if (data.success) {
-        setCurrentPokerGame(data.gameState);
-        setMyPokerHand(data.hand || []);
-        const currentPath = window.location.pathname;
-        const expectedPath = `/home/poker/table/${data.gameState.gameId}`;
-        if (currentPath !== expectedPath && !currentPath.includes('/home/private/') && !currentPath.includes('/home/global') && !currentPath.includes('/home/rooms/')) {
-          navigate(expectedPath);
-        }
-      }
-    } catch (error) {
-      console.error('Error checking current poker game:', error);
-    }
-  };
-
-  const connectWebSocket = () => {
-    if (websocketRef.current && websocketRef.current.readyState !== WebSocket.CLOSED) {
-      return;
-    }
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.hostname}:3000/ws`;
-    websocketRef.current = new WebSocket(wsUrl);
-
-    websocketRef.current.onopen = () => setConnectionStatus("connected");
-
-    websocketRef.current.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        switch (data.type) {
-          case "broadcast":
-            setMessages((prev) => [...prev, {type:'broadcast', content: data.content, username: data.username }]);
-            break;
-          case "private_message":
-            setMessages((prev) => [...prev, {type:'private_message', sender: data.sender, to: data.to, text: data.text}]);
-            break;
-          case "usernames":
-            setUsers(data.content);
-            break;
-          case 'available_rooms':
-            setAvailableRooms(data.content);
-            break;
-          case 'joined_rooms':
-            setJoinedRooms(data.content);
-            break;
-          case 'room_message':
-            setMessages((prev) => [...prev, {type: 'room_message', room: data.room, sender: data.sender, text: data.text, timestamp: data.timestamp}]);
-            break;
-          case 'room_user_count':
-            setUsersInRooms(prev => new Map(prev).set(data.room, data.count));
-            break;
-          case 'poker_game_state':
-            setCurrentPokerGame(data.gameState);
-            break;
-          case 'poker_hand':
-            setMyPokerHand(data.hand);
-            break;
-          case 'poker_left_game':
-            setCurrentPokerGame(null);
-            setMyPokerHand([]);
-            navigate('/home/poker');
-            break;
-          case 'poker_lobby_update':
-            setPokerGames(data.games);
-            break;
-          case 'hangman_lobby_update':
-            setHangmanGames(data.games);
-            break;
-          case 'hangman_game_state':
-            setCurrentHangmanGame(data.gameState);
-            break;
-          case 'error':
-            alert(`Eroare de la server: ${data.message}`);
-            console.error('WebSocket error:', data.message);
-            break;
-          default:
-            console.warn("Unknown message type:", data.type);
-        }
-      } catch (e) {
-        console.error("Error parsing WebSocket message:", e, "Raw data:", event.data);
-      }
-    };
-
-    websocketRef.current.onclose = () => {
-      console.log("WebSocket connection closed");
-      setConnectionStatus("disconnected");
-    };
-    websocketRef.current.onerror = (error) => {
-      console.error("WebSocket error:", error);
-      setConnectionStatus("disconnected");
-    };
-  };
-
-  const disconnectWebSocket = () => {
-    if (websocketRef.current) {
-      websocketRef.current.close();
-      websocketRef.current = null;
-    }
-    setConnectionStatus("disconnected");
-  };
-
+  // --- Message Sending ---
   const sendMessage = (message) => {
-    if (websocketRef.current?.readyState === WebSocket.OPEN) {
-      const messageToSend = typeof message === 'string' ? {type: "broadcast", content: message} : message;
-      websocketRef.current.send(JSON.stringify(messageToSend));
-    } else {
-      console.warn("WebSocket not open. Message not sent:", message);
+    if (typeof message === 'string') {
+        sendActionViaAPI('/api/chat/global', { message });
+    } 
+    else if (message.type === 'private_message') {
+        sendActionViaAPI('/api/chat/private', { to: message.to, message: message.text });
+    } 
+    else if (message.type === 'sendRoomMessage') {
+        sendActionViaAPI(`/api/chat/room/${message.room}`, { message: message.text });
     }
   };
 
-  const handleLoginSuccess = (loggedInUsername) => {
+  // --- Login/Logout ---
+  
+const handleLogin = (loggedInUsername) => {
+    console.log('[App] Login successful:', loggedInUsername);
     setUsername(loggedInUsername);
     setIsLoggedIn(true);
     
-    // Connect WebSocket immediately after login
+    // Așteaptă puțin ca browser-ul să proceseze cookie-ul
     setTimeout(() => {
-      connectWebSocket();
-      fetchPokerGames();
-      fetchHangmanGames();
-    }, 100);
+        connectSSE();
+        fetchPokerGames();
+        fetchHangmanGames();
+        fetchRooms(); // ✅ IMPORTANT
+    }, 300);
     
     const storedPrivateChat = localStorage.getItem('lastPrivateChatPartner');
     const storedRoomChat = localStorage.getItem('lastRoomChat');
     
     if (storedPrivateChat) {
-      navigate(`/home/private/${storedPrivateChat}`);
+        navigate(`/home/private/${storedPrivateChat}`);
     } else if (storedRoomChat) {
-      navigate(`/home/rooms/${storedRoomChat}`);
+        navigate(`/home/rooms/${storedRoomChat}`);
     } else {
-      navigate('/home');
+        navigate('/home');
     }
-  };
+};
+
+
 
   const handleLogout = async () => {
+    console.log('[App] Logging out...');
     try {
       await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
     } catch (error) {
@@ -293,7 +431,7 @@ function App() {
       setUsers([]);
       setAvailableRooms([]);
       setJoinedRooms([]);
-      disconnectWebSocket();
+      disconnectSSE();
       
       localStorage.removeItem('lastPrivateChatPartner');
       localStorage.removeItem('lastRoomChat');
@@ -305,27 +443,157 @@ function App() {
     }
   };
 
-  const handleCreateRoom = (roomName) => {
-    sendMessage({ type: "create_room", room: roomName });
-    localStorage.setItem('lastRoomChat', roomName.trim().toLowerCase());
-    setLastRoomChat(roomName.trim().toLowerCase());
-    navigate(`/home/rooms/${roomName.trim().toLowerCase()}`);
-  };
+  // --- Chat Rooms ---
+ const handleCreateRoom = async (roomName) => {
+    const trimmedRoom = roomName.trim().toLowerCase();
+    
+    if (!trimmedRoom) {
+        alert('Numele camerei nu poate fi gol');
+        return;
+    }
+    
+    console.log('[handleCreateRoom] Attempting to create room:', trimmedRoom);
+    
+    try {
+        const response = await fetch('/api/chat/rooms/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ roomName: trimmedRoom })
+        });
+        
+        console.log('[handleCreateRoom] Response status:', response.status);
+        
+        if (!response.ok) {
+            const errorData = await response.json();
+            console.error('[handleCreateRoom] Error response:', errorData);
+            alert(`Eroare ${response.status}: ${errorData.error || 'Nu s-a putut crea camera'}`);
+            return;
+        }
+        
+        const data = await response.json();
+        console.log('[handleCreateRoom] Success response:', data);
+        
+        if (data.success) {
+            // Adaugă local pentru feedback imediat
+            if (!availableRooms.includes(trimmedRoom)) {
+                setAvailableRooms(prev => [...prev, trimmedRoom]);
+            }
+            if (!joinedRooms.includes(trimmedRoom)) {
+                setJoinedRooms(prev => [...prev, trimmedRoom]);
+            }
+            
+            localStorage.setItem('lastRoomChat', trimmedRoom);
+            setLastRoomChat(trimmedRoom);
+            
+            console.log(`[Room Created] ${trimmedRoom}`);
+            navigate(`/home/rooms/${trimmedRoom}`);
+        } else {
+            alert(data.error || 'Nu s-a putut crea camera');
+        }
+    } catch (error) {
+        console.error('[handleCreateRoom] Catch error:', error);
+        alert(`Eroare la crearea camerei: ${error.message}`);
+    }
+};
 
-  const handleJoinRoom = (roomName) => {
-    sendMessage({ type: "join_room", room: roomName });
-    localStorage.setItem('lastRoomChat', roomName.trim().toLowerCase());
-    setLastRoomChat(roomName.trim().toLowerCase());
-    navigate(`/home/rooms/${roomName.trim().toLowerCase()}`);
-  };
+
+const handleJoinRoom = async (roomName) => {
+    const trimmedRoom = roomName.trim().toLowerCase();
+    
+    try {
+        const response = await fetch('/api/chat/rooms/join', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ roomName: trimmedRoom })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            // Adaugă în joined rooms
+            if (!joinedRooms.includes(trimmedRoom)) {
+                setJoinedRooms(prev => [...prev, trimmedRoom]);
+            }
+            
+            localStorage.setItem('lastRoomChat', trimmedRoom);
+            setLastRoomChat(trimmedRoom);
+            
+            console.log(`[Room Joined] ${trimmedRoom}`);
+            navigate(`/home/rooms/${trimmedRoom}`);
+        } else {
+            alert(data.error || 'Nu te poți alătura camerei');
+        }
+    } catch (error) {
+        console.error('Error joining room:', error);
+        alert('Eroare la intrarea în cameră. Verifică conexiunea.');
+    }
+};
+
   
-  const handleLeaveRoom = (roomName) => {
-    sendMessage({ type: "leave_room", room: roomName });
-  };
+  const handleLeaveRoom = async (roomName) => {
+    try {
+        const response = await fetch('/api/chat/rooms/leave', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ roomName })
+        });
+        
+        const data = await response.json();
+        
+        if (data.success) {
+            // Șterge din joined rooms
+            setJoinedRooms(prev => prev.filter(r => r !== roomName));
+            setLastRoomChat(null);
+            localStorage.removeItem('lastRoomChat');
+            
+            console.log(`[Room Left] ${roomName}`);
+            navigate('/home/rooms');
+        } else {
+            console.error('Failed to leave room:', data.error);
+        }
+    } catch (error) {
+        console.error('Error leaving room:', error);
+        // Șterge local oricum pentru a nu bloca UI-ul
+        setJoinedRooms(prev => prev.filter(r => r !== roomName));
+        navigate('/home/rooms');
+    }
+};
 
+const fetchRooms = async () => {
+    try {
+        const response = await fetch('/api/chat/rooms', { 
+            credentials: 'include' 
+        });
+        const data = await response.json();
+        
+        if (data.success) {
+            // data.rooms poate fi array de obiecte { roomName, memberCount }
+            const roomNames = data.rooms.map(r => r.roomName || r);
+            setAvailableRooms(roomNames);
+            
+            // Opțional: salvează și numărul de membri
+            const counts = new Map();
+            data.rooms.forEach(r => {
+                if (r.memberCount !== undefined) {
+                    counts.set(r.roomName || r, r.memberCount);
+                }
+            });
+            setUsersInRooms(counts);
+            
+            console.log('[Rooms Fetched]', roomNames);
+        }
+    } catch (error) {
+        console.error('Error fetching rooms:', error);
+    }
+};
+
+  // --- Poker Functions ---
   const fetchPokerGames = async () => {
     try {
-      const response = await fetch('/api/auth/poker/games', { credentials: 'include' });
+      const response = await fetch('/api/poker/games', { credentials: 'include' });
       const data = await response.json();
       if (data.success) setPokerGames(data.games);
     } catch (error) {
@@ -334,132 +602,117 @@ function App() {
   };
 
   const createPokerGame = async (gameId, password, smallBlind, bigBlind, maxPlayers, stack) => {
-    try {
-      const response = await fetch('/api/auth/poker/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ gameId, password, smallBlind, bigBlind, maxPlayers, stack })
-      });
-      const data = await response.json();
-      if (data.success) {
+    const data = await sendActionViaAPI('/api/poker/create', { 
+        gameId, password, 
+        options: { smallBlind, bigBlind, maxPlayers, minPlayers: 2 }
+    });
+    if (data.success) {
         setCurrentPokerGame(data.gameState);
         navigate(`/home/poker/table/${gameId}`);
-      } else {
-        alert(data.error);
-      }
-    } catch (error) {
-      alert('Eroare la crearea jocului.');
-    }
+    } 
   };
 
   const joinPokerGame = async (gameId, password, stack) => {
-    try {
-      const response = await fetch('/api/auth/poker/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ gameId, password, stack })
-      });
-      const data = await response.json();
-      if (data.success) {
+    const data = await sendActionViaAPI('/api/poker/join', { gameId, password });
+    if (data.success) {
         setCurrentPokerGame(data.gameState);
-        sendMessage({ type: "poker_get_hand", gameId });
         navigate(`/home/poker/table/${gameId}`);
-      } else {
-        alert(data.error);
-      }
-    } catch (error) {
-      alert('Eroare la intrarea în joc.');
     }
   };
 
   const sendPokerAction = (action, amount = 0) => {
-    if (websocketRef.current?.readyState === WebSocket.OPEN && currentPokerGame) {
-      sendMessage({ type: "poker_action", gameId: currentPokerGame.gameId, action, amount });
+    if (currentPokerGame) {
+      sendActionViaAPI('/api/poker/action', { 
+        gameId: currentPokerGame.gameId, 
+        action, 
+        amount 
+      });
     }
   };
 
   const startPokerGame = () => {
-    if (websocketRef.current?.readyState === WebSocket.OPEN && currentPokerGame) {
-      sendMessage({ type: "poker_start_game", gameId: currentPokerGame.gameId });
+    if (currentPokerGame) {
+      sendActionViaAPI('/api/poker/action', { 
+        gameId: currentPokerGame.gameId, 
+        action: 'start_game' 
+      });
     }
   };
 
   const startNewHand = () => {
-    if (websocketRef.current?.readyState === WebSocket.OPEN && currentPokerGame) {
-        sendMessage({ type: "poker_start_new_hand", gameId: currentPokerGame.gameId });
+    if (currentPokerGame) {
+        sendActionViaAPI('/api/poker/action', { 
+          gameId: currentPokerGame.gameId, 
+          action: 'start_new_hand' 
+        });
     }
   };
 
-  const leavePokerGame = () => {
-    if (websocketRef.current?.readyState === WebSocket.OPEN && currentPokerGame) {
-      sendMessage({ type: "poker_leave_game", gameId: currentPokerGame.gameId });
+  const leavePokerGame = async () => {
+    if (currentPokerGame) {
+        const gameId = currentPokerGame.gameId;
+        const data = await sendActionViaAPI('/api/poker/leave', { gameId }, 'DELETE');
+        if (data.success) {
+            setCurrentPokerGame(null);
+            setMyPokerHand([]);
+            navigate('/home/poker');
+        }
     } else {
-      setCurrentPokerGame(null);
-      setMyPokerHand([]);
       navigate('/home/poker');
     }
   };
 
+  // --- Hangman Functions ---
+  const fetchHangmanGames = async () => {
+    try {
+        const response = await fetch('/api/hangman/games', { credentials: 'include' });
+        const data = await response.json();
+        if (data.success) setHangmanGames(data.games);
+    } catch (error) {
+        console.error('Error fetching hangman games:', error);
+    }
+  };
+
+  const createHangmanGame = async(gameId)=>{
+    const data = await sendActionViaAPI('/api/hangman/create', { gameId });
+    if(data.success){
+      setCurrentHangmanGame(data.gameState);
+      navigate(`/home/hangman/game/${gameId}`);
+    }
+  }
+
+  const joinHangmanGame = async(gameId)=>{
+    const data = await sendActionViaAPI('/api/hangman/join', { gameId });
+    if(data.success){
+      navigate(`/home/hangman/game/${gameId}`);
+    }
+  }
+
+  const setHangmanWord = async (word)=>{
+    if(currentHangmanGame){
+      await sendActionViaAPI('/api/hangman/set-word', {
+        gameId:currentHangmanGame.gameId,
+        word
+      });
+    }
+  }
+
+  const guessHangmanLetter =(letter)=>{
+    if(currentHangmanGame){
+      sendActionViaAPI('/api/hangman/action', {
+        gameId:currentHangmanGame.gameId,
+        letter
+      });
+    }
+  }
+
+  // --- Navigation ---
   const handleChatPartnerChange = (chatPartner) => {
     setLastPrivateChatPartner(chatPartner);
   };
 
   const handleRoomChange = (roomName) => {
     setLastRoomChat(roomName);
-  };
-
-  const EnhancedPrivateChat = ({ messages, users, username, sendMessage, connectionStatus }) => {
-    const currentPath = window.location.pathname;
-    if (currentPath === '/home/private' && lastPrivateChatPartner) {
-      navigate(`/home/private/${lastPrivateChatPartner}`, { replace: true });
-      return null;
-    }
-
-    return (
-      <PrivateChat 
-        messages={messages.filter(msg => msg.type === 'private_message' && (msg.sender === username || msg.to === username))} 
-        users={users} 
-        username={username} 
-        sendMessage={sendMessage} 
-        connectionStatus={connectionStatus} 
-      />
-    );
-  };
-
-  const EnhancedRoomChat = ({ 
-    messages, 
-    username, 
-    connectionStatus, 
-    sendMessage, 
-    availableRooms, 
-    joinedRooms, 
-    usersInRooms, 
-    onJoinRoom, 
-    onCreateRoom, 
-    onLeaveRoom 
-  }) => {
-    const currentPath = window.location.pathname;
-    if (currentPath === '/home/rooms' && lastRoomChat) {
-      navigate(`/home/rooms/${lastRoomChat}`, { replace: true });
-      return null;
-    }
-
-    return (
-      <RoomChat 
-        messages={messages}
-        username={username}
-        connectionStatus={connectionStatus}
-        sendMessage={sendMessage}
-        availableRooms={availableRooms}
-        joinedRooms={joinedRooms}
-        usersInRooms={usersInRooms}
-        onJoinRoom={onJoinRoom}
-        onCreateRoom={onCreateRoom}
-        onLeaveRoom={onLeaveRoom}
-      />
-    );
   };
 
   const handlePrivateNavigation = () => {
@@ -486,161 +739,87 @@ function App() {
     }
   };
 
-  const fetchHangmanGames = async () => {
-    try {
-        const response = await fetch('/api/auth/hangman/games', { credentials: 'include' });
-        const data = await response.json();
-        if (data.success) setHangmanGames(data.games);
-    } catch (error) {
-        console.error('Error fetching hangman games:', error);
-    }
-};
-
-
-  const createHangmanGame = async(gameId)=>{
-    try{
-      const response = await fetch('/api/auth/hangman/create',{
-        method:'POST',
-        headers:{'Content-Type': 'application/json'},
-        credentials:'include',
-        body: JSON.stringify({gameId})
-      })
-      const data = await response.json()
-      if(data.success){
-        setCurrentHangmanGame(data.gameState);
-        navigate(`/home/hangman/game/${gameId}`)
-      }else{
-        alert(data.error);
-      }
-    }catch(error){
-      alert('Eroare la crearea jocului')
-      console.log('Eroare la crearea jocului')
-    }
-
-  }
-
-  const joinHangmanGame = async(gameId)=>{
-    try{
-      const response = await fetch('/api/auth/hangman/join',{
-        method:'POST',
-        headers:{'Content-Type' : 'application/json'},
-        credentials: 'include',
-        body: JSON.stringify({gameId})
-      })
-      const data = await response.json();
-      if(data.success){
-        setCurrentHangmanGame(data.gameState)
-        navigate(`/home/hangman/game/${gameId}`)
-      }else{
-        alert(data.error)
-        console.log(data.error)
-      }
-    }catch(error){
-      alert('Eroare la alăturarea jocului.');
-      console.log('Eroare la alăturarea jocului.');
-    }
-  }
-
-  const setHangmanWord = (word)=>{
-    if(currentHangmanGame){
-      sendMessage({
-        type: 'hangman_set_word',
-        gameId:currentHangmanGame.gameId,
-        word
-      })
-    }
-  }
-
-  const guessHangmanLetter =(letter)=>{
-    if(currentHangmanGame){
-      sendMessage({
-        type:'hangman_guess_letter',
-        gameId:currentHangmanGame.gameId,
-        letter
-      })
-    }
-  }
-
   const handleHangmanNavigation = () => {
     navigate('/home/hangman');
-};
-  
+  };
+
+
   return (
-  <Routes>
-    <Route path="/" element={!isLoggedIn ? <WelcomePage /> : <Navigate to="/home" />} />
-    <Route path="/login" element={!isLoggedIn ? <Login onLogin={handleLoginSuccess} /> : <Navigate to="/home" />} />
-    <Route path="/register" element={!isLoggedIn ? <Register /> : <Navigate to="/home" />} />
-    
-    <Route 
-      path="/home" 
-      element={
-        isLoggedIn ? 
-        <Header 
-          username={username} 
-          onLogout={handleLogout} 
-          connectionStatus={connectionStatus} 
-          users={users} 
-          onPrivateNavigation={handlePrivateNavigation} 
-          onRoomNavigation={handleRoomNavigation} 
-          onPokerNavigation={handlePokerNavigation} 
-          onHangmanNavigation={handleHangmanNavigation} 
-        /> : 
-        <Navigate to="/login" />
-      }
-    >
-      <Route index element={<Navigate to="global" replace />} />
+    <Routes>
+      <Route path="/" element={!isLoggedIn ? <WelcomePage /> : <Navigate to="/home" />} />
+      <Route path="/login" element={!isLoggedIn ? <Login onLogin={handleLogin} /> : <Navigate to="/home" />} />
+      <Route path="/register" element={!isLoggedIn ? <Register /> : <Navigate to="/home" />} />
       
-      <Route path="global" element={<GlobalChat messages={messages.filter(msg => msg.type === 'broadcast')} sendMessage={sendMessage} username={username} connectionStatus={connectionStatus} />} />
-      
-      <Route path="rooms" element={<EnhancedRoomChat messages={messages} username={username} connectionStatus={connectionStatus} sendMessage={sendMessage} availableRooms={availableRooms} joinedRooms={joinedRooms} usersInRooms={usersInRooms} onJoinRoom={handleJoinRoom} onCreateRoom={handleCreateRoom} onLeaveRoom={handleLeaveRoom} />} />
-      <Route path="rooms/:roomName" element={<RoomChatWrapper messages={messages} username={username} connectionStatus={connectionStatus} sendMessage={sendMessage} availableRooms={availableRooms} joinedRooms={joinedRooms} usersInRooms={usersInRooms} onJoinRoom={handleJoinRoom} onCreateRoom={handleCreateRoom} onLeaveRoom={handleLeaveRoom} onRoomChange={handleRoomChange} />} />
-      
-      <Route path="private" element={<EnhancedPrivateChat messages={messages} users={users} username={username} sendMessage={sendMessage} connectionStatus={connectionStatus} />} />
-      <Route path="private/:chatPartner" element={<PrivateChatWrapper messages={messages} users={users} username={username} sendMessage={sendMessage} connectionStatus={connectionStatus} onChatPartnerChange={handleChatPartnerChange} />} />
-      
-      <Route path="poker" element={<PokerLobby availableGames={pokerGames} onCreateGame={createPokerGame} onJoinGame={joinPokerGame} onRefresh={fetchPokerGames} />} />
-      <Route
-          path="poker/table/:gameId"
+      <Route 
+        path="/home" 
+        element={
+          isLoggedIn ? 
+          <Header 
+            username={username} 
+            onLogout={handleLogout} 
+            connectionStatus={connectionStatus} 
+            users={users} 
+            onPrivateNavigation={handlePrivateNavigation} 
+            onRoomNavigation={handleRoomNavigation} 
+            onPokerNavigation={handlePokerNavigation} 
+            onHangmanNavigation={handleHangmanNavigation} 
+          /> : 
+          <Navigate to="/login" />
+        }
+      >
+        <Route index element={<Navigate to="global" replace />} />
+        
+        <Route path="global" element={<GlobalChat messages={messages.filter(msg => msg.type === 'broadcast')} sendMessage={sendMessage} username={username} connectionStatus={connectionStatus} />} />
+        
+        <Route path="rooms" element={<RoomChat messages={messages} username={username} connectionStatus={connectionStatus} sendMessage={sendMessage} availableRooms={availableRooms} joinedRooms={joinedRooms} usersInRooms={usersInRooms} onJoinRoom={handleJoinRoom} onCreateRoom={handleCreateRoom} onLeaveRoom={handleLeaveRoom} />} />
+        <Route path="rooms/:roomName" element={<RoomChatWrapper messages={messages} username={username} connectionStatus={connectionStatus} sendMessage={sendMessage} availableRooms={availableRooms} joinedRooms={joinedRooms} usersInRooms={usersInRooms} onJoinRoom={handleJoinRoom} onCreateRoom={handleCreateRoom} onLeaveRoom={handleLeaveRoom} onRoomChange={handleRoomChange} />} />
+        
+        <Route path="private" element={<PrivateChat messages={messages.filter(msg => msg.type === 'private_message' && (msg.sender === username || msg.to === username))} users={users} username={username} sendMessage={sendMessage} connectionStatus={connectionStatus} />} />
+        <Route path="private/:chatPartner" element={<PrivateChatWrapper messages={messages} users={users} username={username} sendMessage={sendMessage} connectionStatus={connectionStatus} onChatPartnerChange={handleChatPartnerChange} />} />
+        
+        <Route path="poker" element={<PokerLobby availableGames={pokerGames} onCreateGame={createPokerGame} onJoinGame={joinPokerGame} onRefresh={fetchPokerGames} />} />
+        <Route
+            path="poker/table/:gameId"
+            element={
+                <PokerTable 
+                    pokerState={currentPokerGame}
+                    myHand={myPokerHand}
+                    username={username}
+                    onPokerAction={sendPokerAction}
+                    onStartGame={startPokerGame}
+                    onNewHand={startNewHand}
+                    onLeaveGame={leavePokerGame}
+                />
+            }
+        />
+        
+        <Route
+          path="hangman"
           element={
-              <PokerTable 
-                  pokerState={currentPokerGame}
-                  myHand={myPokerHand}
-                  username={username}
-                  onPokerAction={sendPokerAction}
-                  onStartGame={startPokerGame}
-                  onNewHand={startNewHand}
-                  onLeaveGame={leavePokerGame}
-              />
+            <HangmanLobby
+              availableGames={hangmanGames}
+              onCreateGame={createHangmanGame}
+              onJoinGame={joinHangmanGame}
+              onRefresh={fetchHangmanGames}
+            />
           }
-      />
+        />
+        <Route
+          path="hangman/game/:gameId"
+          element={
+            <HangmanGame
+              gameState={currentHangmanGame}
+              username={username}
+              onSetWord={setHangmanWord}
+              onGuessLetter={guessHangmanLetter}
+            />
+          }
+        />
+      </Route>      
       
-      <Route
-        path="hangman"
-        element={
-          <HangmanLobby
-            availableGames={hangmanGames}
-            onCreateGame={createHangmanGame}
-            onJoinGame={joinHangmanGame}
-            onRefresh={fetchHangmanGames}
-          />
-        }
-      />
-      <Route
-        path="hangman/game/:gameId"
-        element={
-          <HangmanGame
-            gameState={currentHangmanGame}
-            username={username}
-            onSetWord={setHangmanWord}
-            onGuessLetter={guessHangmanLetter}
-          />
-        }
-      />
-    </Route>      
-    
-    <Route path="*" element={<Navigate to="/" />} />
-  </Routes>
-);
+      <Route path="*" element={<Navigate to="/" />} />
+    </Routes>
+  );
 }
 
 export default App;

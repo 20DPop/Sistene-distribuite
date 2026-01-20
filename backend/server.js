@@ -4,12 +4,13 @@ const serve = require("koa-static");
 const bodyParser = require('koa-bodyparser');
 const mongoose = require('mongoose');
 const path = require('path');
+const fs = require('fs');
 
-// Configurații și Module Interne
+// Configurații și Module de Comunicare
 const config = require("./src/config");
 const { routes } = require("./src/routes");
 const { subscriber: redisSubscriber } = require('./src/redisClient');
-const { connectRabbitMQ, getChannel, GLOBAL_CHAT_EXCHANGE, ROOM_CHAT_EXCHANGE } = require('./src/rabbitClient');
+const { connectRabbitMQ, getChannel, isConnected, GLOBAL_CHAT_EXCHANGE, ROOM_CHAT_EXCHANGE } = require('./src/rabbitClient');
 const sseManager = require('./src/sseManager');
 
 // Modele pentru interogări în Subscriberi
@@ -18,50 +19,69 @@ const HangmanGame = require('./src/models/hangmanGame.model');
 
 const app = new Koa();
 
-// --- 1. CONECTARE MONGODB ---
+// --- 1. CONECTARE MONGODB (Baza de date partajată) ---
 const mongoURI = process.env.MONGO_URI || 'mongodb://localhost:27017/distributed_games';
-mongoose.connect(mongoURI)
-  .then(() => console.log('✅ Connected to MongoDB (Shared Database)'))
-  .catch(err => { 
-      console.error('❌ MongoDB Connection Error:', err); 
-      process.exit(1); 
-  });
 
-// --- 2. CONFIGURARE RABBITMQ (CHAT DISTRIBUIT) ---
+mongoose.connect(mongoURI, {
+    serverSelectionTimeoutMS: 5000,
+    socketTimeoutMS: 45000,
+})
+.then(() => console.log('✅ Connected to MongoDB'))
+.catch(err => { 
+    console.error('❌ MongoDB Connection Error:', err); 
+    process.exit(1); 
+});
+
+// MongoDB error handlers
+mongoose.connection.on('error', (err) => {
+    console.error('❌ MongoDB runtime error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+    console.warn('⚠️ MongoDB disconnected');
+});
+
+mongoose.connection.on('reconnected', () => {
+    console.log('✅ MongoDB reconnected');
+});
+
+// --- 2. CONFIGURARE RABBITMQ (Distribuție Chat între Noduri) ---
 async function setupRabbitMQSubscription() {
     try {
         await connectRabbitMQ();
+        
+        if (!isConnected()) {
+            console.error('[RabbitMQ] Failed to establish connection');
+            return;
+        }
+        
         const channel = getChannel();
         
         // Creăm o coadă temporară, exclusivă pentru acest nod de server
         const { queue } = await channel.assertQueue('', { exclusive: true });
 
-        // Bindings: Ascultăm tot ce mișcă în rețeaua de chat
-        channel.bindQueue(queue, GLOBAL_CHAT_EXCHANGE, '');            // Global
-        channel.bindQueue(queue, ROOM_CHAT_EXCHANGE, 'room.#');       // Camere
-        channel.bindQueue(queue, ROOM_CHAT_EXCHANGE, 'private.#');    // Mesaje Private
+        // Bindings: Ascultăm mesajele de chat din toată rețeaua
+        await channel.bindQueue(queue, GLOBAL_CHAT_EXCHANGE, '');            
+        await channel.bindQueue(queue, ROOM_CHAT_EXCHANGE, 'room.#');       
+        await channel.bindQueue(queue, ROOM_CHAT_EXCHANGE, 'private.#');    
 
         console.log(`✅ RabbitMQ Subscribed on this node (Queue: ${queue})`);
 
         channel.consume(queue, (msg) => {
-            if (msg.content) {
+            if (msg && msg.content) {
                 try {
                     const data = JSON.parse(msg.content.toString());
                     const routingKey = msg.fields.routingKey;
 
-                    // A. Chat Global
+                    // Redirecționăm mesajul către clienții SSE conectați la ACEST nod
                     if (msg.fields.exchange === GLOBAL_CHAT_EXCHANGE) {
                         sseManager.broadcastEvent('globalChatMessage', data);
                     } 
-                    // B. Chat de Cameră (Poker sau Hangman Room)
                     else if (routingKey.startsWith('room.')) {
                         sseManager.sendEventToRoom(data.room, 'roomChatMessage', data);
                     }
-                    // C. Chat Privat
                     else if (routingKey.startsWith('private.')) {
-                        // Managerul va livra mesajul doar dacă Ionuț e conectat la ACEST nod
                         sseManager.sendEventToUser(data.to, 'privateChatMessage', data);
-                        // Trimitem și expeditorului pentru a sincroniza UI-ul (în caz că are mai multe tab-uri)
                         sseManager.sendEventToUser(data.sender, 'privateChatMessage', data);
                     }
                 } catch (e) {
@@ -69,32 +89,29 @@ async function setupRabbitMQSubscription() {
                 }
             }
         }, { noAck: true });
+        
     } catch (err) {
-        console.error('❌ Failed to set up RabbitMQ subscription:', err);
+        console.error('❌ RabbitMQ Subscription setup failed:', err);
+        // Nu oprim serverul, va reîncerca automat să se reconecteze
     }
 }
 
-// --- 3. CONFIGURARE REDIS (GAME UPDATES DISTRIBUITE) ---
+// --- 3. CONFIGURARE REDIS (Sincronizare Stare Jocuri) ---
 async function setupRedisSubscription() {
     try {
-        // Ascultăm orice update de joc (Poker sau Hangman)
+        // Ascultăm actualizările de joc publicate de ORICE nod din cluster
         await redisSubscriber.pSubscribe('game-updates:*', async (message, channelName) => {
             try {
                 const gameId = channelName.split(':')[1];
                 const updatedGameState = JSON.parse(message);
 
-                // Încercăm să găsim jucătorii în Poker
+                // Găsim jucătorii în DB pentru a vedea cine este conectat local pe acest nod
                 let game = await PokerGame.findOne({ gameId }, 'players.username');
-                
-                // Dacă nu e poker, căutăm în Hangman
-                if (!game) {
-                    game = await HangmanGame.findOne({ gameId }, 'players.username');
-                }
+                if (!game) game = await HangmanGame.findOne({ gameId }, 'players.username');
 
                 if (game && game.players) {
-                    // Trimitem starea proaspătă doar jucătorilor din acel joc
-                    // care sunt conectați la ACEST nod de server
                     game.players.forEach(player => {
+                        // Trimitem starea nouă doar dacă utilizatorul are un stream SSE deschis aici
                         sseManager.sendEventToUser(player.username, 'gameStateUpdate', updatedGameState);
                     });
                 }
@@ -103,55 +120,138 @@ async function setupRedisSubscription() {
             }
         });
 
-        // Opțional: Ascultăm și update-uri de prezență (pentru a forța refresh la lista de useri online)
-        await redisSubscriber.subscribe('user-presence-updates', async (message) => {
-            const onlineUsers = await sseManager.getGlobalOnlineUsers();
-            sseManager.broadcastEvent('usersOnlineUpdate', onlineUsers);
+        // Sync listă utilizatori online
+        await redisSubscriber.subscribe('user-presence-updates', async () => {
+            try {
+                const onlineUsers = await sseManager.getGlobalOnlineUsers();
+                sseManager.broadcastEvent('usersOnlineUpdate', onlineUsers);
+            } catch (err) {
+                console.error("[Redis Subscriber] Error broadcasting users:", err);
+            }
         });
 
-        console.log("✅ Redis Subscribed to game-updates:* and presence");
+        console.log("✅ Redis Subscribed to game-updates and presence");
     } catch (err) {
-        console.error("❌ Failed to subscribe to Redis channels:", err);
+        console.error("❌ Redis Subscription failed:", err);
+        // Redis client are propria logică de reconnect
     }
 }
 
-// --- 4. PORNIRE SUBSCRIPȚII ---
+// Pornire procese asincrone
 setupRabbitMQSubscription();
 setupRedisSubscription();
 
-// --- 5. MIDDLEWARE-URI KOA ---
+// --- 4. MIDDLEWARE-URI KOA ---
 
-// Gestionare erori globale
+// A. Gestionare erori (ignora EPIPE pentru SSE)
 app.use(async (ctx, next) => {
     try {
         await next();
     } catch (err) {
+        // Ignoră EPIPE și ECONNRESET - normale pentru SSE disconnect
+        if (err.code === 'EPIPE' || err.code === 'ECONNRESET') {
+            return;
+        }
+        
         ctx.status = err.status || 500;
         ctx.body = { success: false, error: err.message };
         ctx.app.emit('error', err, ctx);
     }
 });
 
-app.use(bodyParser());
+// B. Parser pentru JSON body
+app.use(bodyParser({
+    enableTypes: ['json', 'form'],
+    jsonLimit: '10mb',
+    formLimit: '10mb',
+    onerror: (err, ctx) => {
+        ctx.throw(422, 'Body parse error: ' + err.message);
+    }
+}));
 
-// Servire fișiere statice (Frontend-ul build-uit)
-app.use(serve(path.join(__dirname, "dist")));
+// C. Servire Frontend (folderul /dist generat de React)
+const distPath = path.join(__dirname, "dist");
+if (fs.existsSync(distPath)) {
+    app.use(serve(distPath));
+} else {
+    console.warn('⚠️ Warning: dist folder not found. Frontend will not be served.');
+}
 
-// Rutele API
+// D. Rutele API
 app.use(routes.routes());
 app.use(routes.allowedMethods());
 
-// --- 6. LANSARE SERVER ---
-const port = process.env.PORT || config.port;
-app.listen(port, () => {
-    console.log(`🚀 Distributed Node running on http://localhost:${port}`);
-    console.log(`🔗 Connected to Shared Infrastructure (Mongo, Redis, Rabbit)`);
+// E. SPA FALLBACK (Rezolvă eroarea 404 la refresh pe rute de React precum /home/poker)
+app.use(async (ctx) => {
+    // Dacă am ajuns aici, înseamnă că nicio rută API sau fișier static nu s-a potrivit
+    if (ctx.status === 404 && !ctx.path.startsWith('/api')) {
+        const indexPath = path.join(__dirname, 'dist', 'index.html');
+        if (fs.existsSync(indexPath)) {
+            ctx.type = 'html';
+            ctx.body = fs.createReadStream(indexPath);
+        }
+    }
 });
 
+// --- 5. PORNIRE SERVER ---
+const port = process.env.PORT || config.port;
+const server = app.listen(port, () => {
+    console.log(`🚀 Server running on http://localhost:${port}`);
+    console.log(`🔧 Environment: ${config.isProduction ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+    console.log(`📦 Infrastructure: MongoDB, Redis (pub/sub), RabbitMQ (chat)`);
+});
+
+// --- 6. GRACEFUL SHUTDOWN ---
+const gracefulShutdown = async (signal) => {
+    console.log(`\n${signal} received. Starting graceful shutdown...`);
+    
+    // Oprim acceptarea de noi conexiuni
+    server.close(async () => {
+        console.log('HTTP server closed');
+        
+        try {
+            // Curățăm conexiunile SSE
+            console.log('Closing SSE connections...');
+            // sseManager va fi curățat automat când clienții se deconectează
+            
+            // Închidem MongoDB
+            console.log('Closing MongoDB connection...');
+            await mongoose.connection.close();
+            
+            console.log('✅ Graceful shutdown completed');
+            process.exit(0);
+        } catch (err) {
+            console.error('❌ Error during shutdown:', err);
+            process.exit(1);
+        }
+    });
+    
+    // Forțăm oprirea după 30 secunde
+    setTimeout(() => {
+        console.error('❌ Forced shutdown after timeout');
+        process.exit(1);
+    }, 30000);
+};
+
+// Listeners pentru shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Log erori neprevăzute
 app.on('error', (err, ctx) => {
-    if (err.code !== 'EPIPE') { // Ignorăm erorile de tip "pipe" (când un client SSE închide brusc)
-        console.error('[Koa Server Error]', err);
+    if (err.code !== 'EPIPE' && err.code !== 'ECONNRESET') {
+        console.error('[Koa Error]', err);
     }
+});
+
+// Unhandled rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('⚠️ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+    gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
 module.exports = app;

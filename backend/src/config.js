@@ -1,12 +1,15 @@
-// src/config.js
+// src/config.js - DOCKER COMPATIBLE
 module.exports = {
     port: process.env.PORT || 3001,
     secretKey: "564798ty9GJHB%^&*(KJNLK_your_very_secret_key",
+    isProduction: process.env.NODE_ENV === 'production',
+    
     cookieOptions: {
-        httpOnly: true, // Mai sigur, cookie-ul nu poate fi accesat de JavaScript-ul clientului
-        secure: false,  // În producție, setează pe 'true' dacă folosești HTTPS
-        sameSite: "lax",
-        path: "/"
-    },
-    // Nu mai avem nevoie de căi către fișierele statice aici
+        httpOnly: false,  // Temporar FALSE pentru debugging
+        secure: false,    // FALSE pentru HTTP (nu HTTPS)
+        sameSite: 'lax',  // Important pentru cross-origin
+        path: "/",
+        maxAge: 86400000, // 24 hours
+        domain: undefined // NU setăm domain pentru localhost
+    }
 };

@@ -10,14 +10,24 @@ const Login = ({ onLogin }) => {
     e.preventDefault();
     setError("");
 
+    console.log('[Login] Attempting login for:', username);
+
     fetch("/api/auth/login", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
+      credentials: 'include', // IMPORTANT!
       body: JSON.stringify({ username, password }),
     })
     .then(response => {
+      console.log('[Login] Response status:', response.status);
+      console.log('[Login] Response headers:', response.headers);
+      
+      // Check cookies in response
+      const setCookieHeader = response.headers.get('set-cookie');
+      console.log('[Login] Set-Cookie header:', setCookieHeader);
+      
       if (!response.ok) {
         return response.json().then(errorData => {
           throw errorData;
@@ -26,11 +36,21 @@ const Login = ({ onLogin }) => {
       return response.json();
     })
     .then(data => {
+      console.log('[Login] Response data:', data);
+      
       if (data.success) {
-        onLogin(username);
+        // Check if cookie was set
+        console.log('[Login] Current cookies:', document.cookie);
+        
+        // Delay to allow cookie to be set
+        setTimeout(() => {
+          console.log('[Login] Cookies after delay:', document.cookie);
+          onLogin(username);
+        }, 100);
       }
     })
     .catch((err) => {
+      console.error('[Login] Error:', err);
       const errorMessage = Object.values(err.errors || {}).join(' ') || err.message || "A apărut o eroare neașteptată.";
       setError(errorMessage);
     });
